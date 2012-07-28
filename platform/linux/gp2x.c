@@ -6,6 +6,7 @@
 #include <pthread.h>
 
 #include <linux/fb.h>
+#include <linux/input.h>
 #include <sys/mman.h>
 
 #include <unistd.h>
@@ -20,14 +21,14 @@
 #include <linux/kd.h>
 #include <linux/keyboard.h> 
 
+#include <ao/ao.h>
+
 #include "../gp2x/emu.h"
 #include "../gp2x/gp2x.h"
 #include "../gp2x/usbjoy.h"
 #include "../gp2x/version.h"
 
 #include "log_io.h"
-
-#include "jz4740.h"
 
 /* Define this to the CPU frequency */
 #define CPU_FREQ 336000000    /* CPU clock: 336 MHz */
@@ -45,15 +46,11 @@
 void *gp2x_screen;
 static int current_bpp = 8;
 static int current_pal[256];
-static int sounddev = 0, mixerdev = 0;
+ao_device *ao_dev = NULL;
 int fbfd = 0;
 long int screensize = 0;
 unsigned short *fbp = 0;    	
-
-static unsigned long jz_dev=0;
-static volatile unsigned long  *jz_cdcregl, *jz_cpmregl, *jz_emcregl, *jz_gpioregl, *jz_lcdregl;
-volatile unsigned short *jz_emcregs;
-
+int inputfd = 0;
 
 // dummies
 char *ext_menu = 0, *ext_state = 0;
@@ -235,57 +232,48 @@ void gp2x_init(void)
 	memset(gp2x_screen, 0, 320*240*2 + 320*2);
 
 	struct fb_var_screeninfo vinfo;
-    	struct fb_fix_screeninfo finfo;
+	struct fb_fix_screeninfo finfo;
 
-    	// Open the file for reading and writing
-    	fbfd = open("/dev/fb0", O_RDWR);
-    	if (!fbfd) {
-        	printf("Error: cannot open framebuffer device.\n");
-        	exit(1);
-    	}
-    	printf("The framebuffer device was opened successfully.\n");
+	// Open the file for reading and writing
+	fbfd = open("/dev/fb0", O_RDWR);
+	if (!fbfd) {
+		printf("Error: cannot open framebuffer device.\n");
+		exit(1);
+	}
+	printf("The framebuffer device was opened successfully.\n");
 
-    	// Get fixed screen information
-    	if (ioctl(fbfd, FBIOGET_FSCREENINFO, &finfo)) {
-        	printf("Error reading fixed information.\n");
-        	exit(2);
-    	}
+	// Get fixed screen information
+	if (ioctl(fbfd, FBIOGET_FSCREENINFO, &finfo)) {
+		printf("Error reading fixed information.\n");
+		exit(2);
+	}
 
-    	// Get variable screen information
-    	if (ioctl(fbfd, FBIOGET_VSCREENINFO, &vinfo)) {
-        	printf("Error reading variable information.\n");
-        	exit(3);
-    	}
+	// Get variable screen information
+	if (ioctl(fbfd, FBIOGET_VSCREENINFO, &vinfo)) {
+		printf("Error reading variable information.\n");
+		exit(3);
+	}
 
-    	printf("%dx%d, %dbpp\n", vinfo.xres, vinfo.yres, vinfo.bits_per_pixel );
+	printf("%dx%d, %dbpp\n", vinfo.xres, vinfo.yres, vinfo.bits_per_pixel );
 
-    	// Figure out the size of the screen in bytes
-    	screensize = vinfo.xres * vinfo.yres * vinfo.bits_per_pixel / 8;
+	// Figure out the size of the screen in bytes
+	screensize = vinfo.xres * vinfo.yres * vinfo.bits_per_pixel / 8;
 
-    	// Map the device to memory
-    	fbp = (unsigned short *)mmap(0, screensize, PROT_READ | PROT_WRITE, MAP_SHARED,
-                       fbfd, 0);
-    	if ((int)fbp == -1) {
-        	printf("Error: failed to map framebuffer device to memory.\n");
-        	exit(4);
-    	}
-    	printf("The framebuffer device was mapped to memory successfully.\n");
+	// Map the device to memory
+	fbp = (unsigned short *)mmap(0, screensize, PROT_READ | PROT_WRITE, MAP_SHARED,
+				fbfd, 0);
+	if ((int)fbp == -1) {
+		printf("Error: failed to map framebuffer device to memory.\n");
+		exit(4);
+	}
+	printf("The framebuffer device was mapped to memory successfully.\n");
 	memset(fbp, 0, screensize);
-	
-	// snd
-  	mixerdev = open("/dev/mixer", O_RDWR);
-	if (mixerdev == -1)
-		printf("open(\"/dev/mixer\") failed with %i\n", errno);
 
-	printf("exitting init()\n"); fflush(stdout);
-	
-	if(!jz_dev)  jz_dev = open("/dev/mem", O_RDWR);  
-	jz_gpioregl=(unsigned long  *)mmap(0, 0x300, PROT_READ|PROT_WRITE, MAP_SHARED, jz_dev, 0x10010000);
-	jz_cpmregl=(unsigned long  *)mmap(0, 0x10, PROT_READ|PROT_WRITE, MAP_SHARED, jz_dev, 0x10000000);
-	jz_emcregl=(unsigned long  *)mmap(0, 0x90, PROT_READ|PROT_WRITE, MAP_SHARED, jz_dev, 0x13010000);
-	jz_lcdregl=(unsigned long  *)mmap(0, 0x90, PROT_READ|PROT_WRITE, MAP_SHARED, jz_dev, 0x13050000);
-	jz_emcregs=(unsigned short *)jz_emcregl;
-	
+	inputfd = open("/dev/event0", O_RDWR | O_NONBLOCK);
+
+	// snd
+	ao_initialize();
+
 	//while(jz_lcdregl[0xa8>>2] & 1);
 	//jz_lcdregl[0xa4>>2] = 0;
 	
@@ -297,14 +285,13 @@ void gp2x_deinit(void)
 	LeaveGraphicsMode();
 	CloseKeyboard();
 	free(gp2x_screen);
-	if (sounddev > 0) close(sounddev);
-	close(mixerdev);
-    	munmap(fbp, screensize);
-    	close(fbfd);
-	munmap((void *)jz_gpioregl, 0x300);
-	munmap((void *)jz_cpmregl, 0x10);
-	munmap((void *)jz_emcregl, 0x90);
-	close(jz_dev);
+
+	if (ao_dev) ao_close(ao_dev);
+	ao_dev = NULL;
+	ao_shutdown();
+	munmap(fbp, screensize);
+	close(fbfd);
+	close(inputfd);
 }
 
 /* video */
@@ -387,9 +374,6 @@ static int s_oldrate = 0, s_oldbits = 0, s_oldstereo = 0;
 
 void gp2x_sound_volume(int l, int r)
 {
- 	l=l<0?0:l; l=l>255?255:l; r=r<0?0:r; r=r>255?255:r;
- 	l<<=8; l|=r;
-  	ioctl(mixerdev, SOUND_MIXER_WRITE_VOLUME, &l);
 }
 
 void gp2x_start_sound(int rate, int bits, int stereo)
@@ -399,44 +383,61 @@ void gp2x_start_sound(int rate, int bits, int stereo)
 	// if no settings change, we don't need to do anything
 	if (rate == s_oldrate && s_oldbits == bits && s_oldstereo == stereo) return;
 
-	if (sounddev > 0) close(sounddev);
-	sounddev = open("/dev/dsp", O_WRONLY|O_ASYNC);
-	if (sounddev == -1)
-		printf("open(\"/dev/dsp\") failed with %i\n", errno);
-
-	ioctl(sounddev, SNDCTL_DSP_SPEED,  &rate);
-	ioctl(sounddev, SNDCTL_DSP_SETFMT, &bits);
-	ioctl(sounddev, SNDCTL_DSP_STEREO, &stereo);
 	// calculate buffer size
 	buffers = 12;
 	bsize = rate / 32;
 	if (rate > 22050) { bsize*=4; buffers*=2; } // 44k mode seems to be very demanding
 	while ((bsize>>=1)) frag++;
 	frag |= buffers<<16; // 16 buffers
-	ioctl(sounddev, SNDCTL_DSP_SETFRAGMENT, &frag);
+
+	ao_sample_format ao = { bits, rate, stereo+1, AO_FMT_LITTLE, NULL /*"L,R"*/, };
+	ao_dev = ao_open_live(ao_default_driver_id(), &ao, NULL);
+
 	printf("gp2x_set_sound: %i/%ibit/%s, %i buffers of %i bytes\n",
 		rate, bits, stereo?"stereo":"mono", frag>>16, 1<<(frag&0xffff));
 
 	s_oldrate = rate; s_oldbits = bits; s_oldstereo = stereo;
-	//gp2x_sound_volume(10, 10);
 }
 
 void gp2x_sound_write(void *buff, int len)
 {
-	write(sounddev, buff, len);
+	ao_play(ao_dev, buff, len);
 }
 
 void gp2x_sound_sync(void)
 {
-	ioctl(sounddev, SOUND_PCM_SYNC, 0);
 }
 
 /* joy */
+#define CASE(key, but) \
+  case KEY_##key: \
+	button_states &= ~GP2X_##but; \
+	if (ev.value) button_states |= GP2X_##but; \
+	break
+
+static unsigned long button_states = 0;
 unsigned long gp2x_joystick_read(int allow_usb_joy)
 {
-  	unsigned long value;
-	value = ~((jz_gpioregl[0x300>>2] & 0x280EC067) | ((jz_gpioregl[0x200>>2] & 0x20000) >> 1) | 0x300000);
-	return value;
+	struct input_event ev;
+	while (read(inputfd, &ev, sizeof(struct input_event)) > 0) {
+		switch (ev.code) {
+			CASE(UP, UP);
+			CASE(DOWN, DOWN);
+			CASE(LEFT, LEFT);
+			CASE(RIGHT, RIGHT);
+			CASE(LEFTCTRL, B);
+			CASE(LEFTALT, X);
+			CASE(SPACE, Y);
+			CASE(LEFTSHIFT, A);
+			CASE(TAB, L);
+			CASE(BACKSPACE, R);
+			CASE(ENTER, START);
+			CASE(ESC, SELECT);
+			CASE(PAUSE, PUSH);
+		}
+	}
+
+	return button_states;
 }
 
 /* 940 */
@@ -447,97 +448,6 @@ void Pause940(int yes)
 
 void Reset940(int yes, int bank)
 {
-}
-
-inline int sdram_convert(unsigned int pllin,unsigned int *sdram_freq)
-{
-	register unsigned int ns, dmcr,tmp;
- 
-	ns = 1000000000 / pllin;
-	tmp = SDRAM_TRAS/ns;
-	if (tmp < 4) tmp = 4;
-	if (tmp > 11) tmp = 11;
-	dmcr |= ((tmp-4) << EMC_DMCR_TRAS_BIT);
-
-	tmp = SDRAM_RCD/ns;
-	if (tmp > 3) tmp = 3;
-	dmcr |= (tmp << EMC_DMCR_RCD_BIT);
-
-	tmp = SDRAM_TPC/ns;
-	if (tmp > 7) tmp = 7;
-	dmcr |= (tmp << EMC_DMCR_TPC_BIT);
-
-	tmp = SDRAM_TRWL/ns;
-	if (tmp > 3) tmp = 3;
-	dmcr |= (tmp << EMC_DMCR_TRWL_BIT);
-
-	tmp = (SDRAM_TRAS + SDRAM_TPC)/ns;
-	if (tmp > 14) tmp = 14;
-	dmcr |= (((tmp + 1) >> 1) << EMC_DMCR_TRC_BIT);
-
-	/* Set refresh registers */
-	tmp = SDRAM_TREF/ns;
-	tmp = tmp/64 + 1;
-	if (tmp > 0xff) tmp = 0xff;
-        *sdram_freq = tmp; 
-
-	return 0;
-
-}
- 
-void pll_init(unsigned int clock)
-{
-	register unsigned int cfcr, plcr1;
-	unsigned int sdramclock = 0;
-	int n2FR[33] = {
-		0, 0, 1, 2, 3, 0, 4, 0, 5, 0, 0, 0, 6, 0, 0, 0,
-		7, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0,
-		9
-	};
-	//int div[5] = {1, 4, 4, 4, 4}; /* divisors of I:S:P:L:M */
-  	int div[5] = {1, 3, 3, 3, 3}; /* divisors of I:S:P:L:M */
-	int nf, pllout2;
-
-	cfcr = CPM_CPCCR_CLKOEN |
-		(n2FR[div[0]] << CPM_CPCCR_CDIV_BIT) | 
-		(n2FR[div[1]] << CPM_CPCCR_HDIV_BIT) | 
-		(n2FR[div[2]] << CPM_CPCCR_PDIV_BIT) |
-		(n2FR[div[3]] << CPM_CPCCR_MDIV_BIT) |
-		(n2FR[div[4]] << CPM_CPCCR_LDIV_BIT);
-
-	pllout2 = (cfcr & CPM_CPCCR_PCS) ? clock : (clock / 2);
-
-	/* Init UHC clock */
-//	REG_CPM_UHCCDR = pllout2 / 48000000 - 1;
-    	jz_cpmregl[0x6C>>2] = pllout2 / 48000000 - 1;
-
-	nf = clock * 2 / CFG_EXTAL;
-	plcr1 = ((nf - 2) << CPM_CPPCR_PLLM_BIT) | /* FD */
-		(0 << CPM_CPPCR_PLLN_BIT) |	/* RD=0, NR=2 */
-		(0 << CPM_CPPCR_PLLOD_BIT) |    /* OD=0, NO=1 */
-		(0x20 << CPM_CPPCR_PLLST_BIT) | /* PLL stable time */
-		CPM_CPPCR_PLLEN;                /* enable PLL */          
-
-	/* init PLL */
-//	REG_CPM_CPCCR = cfcr;
-//	REG_CPM_CPPCR = plcr1;
-      	jz_cpmregl[0] = cfcr;
-    	jz_cpmregl[0x10>>2] = plcr1;
-	
-  	sdram_convert(clock,&sdramclock);
-  	if(sdramclock > 0)
-  	{
-//	REG_EMC_RTCOR = sdramclock;
-//	REG_EMC_RTCNT = sdramclock;	  
-      	jz_emcregs[0x8C>>1] = sdramclock;
-    	jz_emcregs[0x88>>1] = sdramclock;	
-
-  	}else
-  	{
-  	printf("sdram init fail!\n");
-  	while(1);
-  	} 
-	
 }
 
 /* faking gp2x cpuctrl.c */
@@ -551,7 +461,6 @@ void cpuctrl_deinit(void)
 
 void set_FCLK(unsigned MHZ)
 {
-	pll_init(MHZ*1000000);
 }
 
 void Disable_940(void)
