@@ -31,7 +31,7 @@ endif
 COPT    += 
 LDFLAGS += 
 COPT    += 
-LDFLAGS += 
+LDFLAGS += -lao -lm -lpng
 
 # frontend
 OBJS += platform/gp2x/main.o platform/gp2x/menu.o platform/gp2x/emu.o platform/gp2x/usbjoy.o \
